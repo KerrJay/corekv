@@ -3,6 +3,7 @@ package utils
 import (
 	"bytes"
 	"sync"
+	"unsafe"
 )
 
 const (
@@ -18,43 +19,50 @@ type SkipList struct {
 }
 
 func NewSkipList(arenaSize int64) *SkipList {
-	arena := newArena(arenaSize)
-	//引入一个空的头结点，因此Key和Value都是空的
+	arena := &Arena{
+		n:   1,
+		buf: make([]byte, arenaSize),
+	}
 	head := newElement(arena, nil, ValueStruct{}, defaultMaxLevel)
-	ho := arena.getElementOffset(head)
+	headOffset := arena.getElementOffset(head)
 
 	return &SkipList{
+		maxLevel:   defaultMaxLevel,
 		currHeight: 1,
-		headOffset: ho,
+		headOffset: headOffset,
 		arena:      arena,
 	}
 }
 
 func newElement(arena *Arena, key []byte, v ValueStruct, height int) *Element {
+	// 注意：先写node，再写key，在写value，然后将key/value的地址写入node的属性中
 	nodeOffset := arena.putNode(height)
-
 	keyOffset := arena.putKey(key)
-	val := encodeValue(arena.putVal(v), v.EncodedSize())
+	valoffset := arena.putVal(v)
+	valueSize := v.EncodedSize()
+	value := encodeValue(valoffset, valueSize)
 
-	elem := arena.getElement(nodeOffset) //这里的elem是根据内存中的地址来读取的，不是arena中的offset
-	elem.score = calcScore(key)
-	elem.keyOffset = keyOffset
-	elem.keySize = uint16(len(key))
-	elem.height = uint16(height)
-	elem.value = val
+	//NOTE: 通过内存地址获取到该地址上的对象
+	ele := (*Element)(unsafe.Pointer(&arena.buf[nodeOffset]))
+	ele.keyOffset = keyOffset
+	ele.keySize = uint16(len(key))
+	ele.value = value
+	ele.height = uint16(height)
+	ele.score = calcScore(key)
 
-	return elem
+	return ele
 }
 
-//用来对value值进行编解码
-//value = valueSize | valueOffset
+// 用来对value值进行编解码
+// value = valueSize | valueOffset
 func encodeValue(valOffset uint32, valSize uint32) uint64 {
-	return uint64(valSize)<<32 | uint64(valOffset)
+
+	return uint64(valOffset)<<32 | uint64(valSize)
 }
 
 func decodeValue(value uint64) (valOffset uint32, valSize uint32) {
-	valOffset = uint32(value)
-	valSize = uint32(value >> 32)
+	valSize = uint32(value)
+	valOffset = uint32(value >> 32)
 	return
 }
 
@@ -71,9 +79,10 @@ type Element struct {
 }
 
 func (e *Element) key(arena *Arena) []byte {
-	return arena.getKey(e.keyOffset, e.keySize)
+	return arena.buf[e.keyOffset : e.keyOffset+uint32(e.keySize)]
 }
 
+// 返回的是内存占用大小
 func (list *SkipList) Size() int64 {
 	return list.arena.Size()
 }
@@ -81,94 +90,13 @@ func (list *SkipList) Size() int64 {
 func (list *SkipList) Add(data *Entry) error {
 	list.lock.Lock()
 	defer list.lock.Unlock()
-	score := calcScore(data.Key)
-	var elem *Element
-	value := ValueStruct{
-		Value: data.Value,
-	}
 
-	//从当前最大高度开始
-	max := list.currHeight
-	//拿到头节点，从第一个开始
-	prevElem := list.arena.getElement(list.headOffset)
-	//用来记录访问路径
-	var prevElemHeaders [defaultMaxLevel]*Element
+	header := list.arena.getElement(list.headOffset)
 
-	for i := max - 1; i >= 0; {
-		//keep visit path here
-		prevElemHeaders[i] = prevElem
-
-		for next := list.getNext(prevElem, int(i)); next != nil; next = list.getNext(prevElem, int(i)) {
-			if comp := list.compare(score, data.Key, next); comp <= 0 {
-				if comp == 0 {
-					vo := list.arena.putVal(value)
-					encV := encodeValue(vo, value.EncodedSize())
-					next.value = encV
-					return nil
-				}
-
-				//find the insert position
-				break
-			}
-
-			//just like linked-list next
-			prevElem = next
-			prevElemHeaders[i] = prevElem
-		}
-
-		topLevel := prevElem.levels[i]
-
-		//to skip same prevHeader's next and fill next elem into temp element
-		for i--; i >= 0 && prevElem.levels[i] == topLevel; i-- {
-			prevElemHeaders[i] = prevElem
-		}
-	}
-
-	level := list.randLevel()
-
-	elem = newElement(list.arena, data.Key, ValueStruct{Value: data.Value}, level)
-	//to add elem to the skiplist
-	off := list.arena.getElementOffset(elem)
-	for i := 0; i < level; i++ {
-		elem.levels[i] = prevElemHeaders[i].levels[i]
-		prevElemHeaders[i].levels[i] = off
-	}
-
-	return nil
 }
 
 func (list *SkipList) Search(key []byte) (e *Entry) {
-	list.lock.RLock()
-	defer list.lock.RUnlock()
-	if list.arena.Size() == 0 {
-		return nil
-	}
 
-	score := calcScore(key)
-
-	prevElem := list.arena.getElement(list.headOffset)
-	i := list.currHeight
-
-	for i >= 0 {
-		for next := list.getNext(prevElem, int(i)); next != nil; next = list.getNext(prevElem, int(i)) {
-			if comp := list.compare(score, key, next); comp <= 0 {
-				if comp == 0 {
-					vo, vSize := decodeValue(next.value)
-					return &Entry{Key: key, Value: list.arena.getVal(vo, vSize).Value}
-				}
-				break
-			}
-
-			prevElem = next
-		}
-
-		topLevel := prevElem.levels[i]
-
-		for i--; i >= 0 && prevElem.levels[i] == topLevel; i-- {
-
-		}
-	}
-	return
 }
 
 func (list *SkipList) Close() error {
@@ -205,20 +133,21 @@ func (list *SkipList) compare(score float64, key []byte, next *Element) int {
 }
 
 func (list *SkipList) randLevel() int {
-	if list.maxLevel <= 1 {
-		return 1
-	}
-	i := 1
-	for ; i < list.maxLevel; i++ {
+	maxLevel := list.maxLevel
+
+	var i = 1
+	for i = 1; i < maxLevel; i++ {
 		if RandN(1000)%2 == 0 {
 			return i
 		}
 	}
+
 	return i
 }
 
-//拿到某个节点，在某个高度上的next节点
-//如果该节点已经是该层最后一个节点（该节点的level[height]将是0），会返回nil
+// 拿到某个节点，在某个高度上的next节点
+// 如果该节点已经是该层最后一个节点（该节点的level[height]将是0），会返回nil
+// 注意:根据内存地址计算
 func (list *SkipList) getNext(e *Element, height int) *Element {
 	return list.arena.getElement(e.getNextOffset(height))
 }

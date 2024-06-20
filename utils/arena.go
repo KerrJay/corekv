@@ -27,76 +27,68 @@ func newArena(n int64) *Arena {
 
 func (s *Arena) allocate(sz uint32) uint32 {
 	//implement me here！！！
-	// 在 arena 中分配指定大小的内存空间
 	offset := atomic.AddUint32(&s.n, sz)
+
 	buflen := len(s.buf)
-	//如果剩下的空间 不足以分配给下一个
 	if buflen-int(offset) < MaxNodeSize {
-		groupby := uint32(len(s.buf))
-		if groupby < 1<<30 {
-			groupby = 1 << 30
+		groupBy := uint32(buflen)
+		if groupBy < 1<<30 {
+			groupBy = 1 << 30
 		}
 
-		if groupby < sz {
-			groupby = sz
+		if sz > groupBy {
+			groupBy = sz
 		}
 
-		newbuf := make([]byte, uint32(len(s.buf))+groupby)
-		AssertTrue(len(s.buf) == copy(newbuf, s.buf))
-		s.buf = newbuf
+		newBuf := make([]byte, uint32(buflen)+groupBy)
+		AssertTrue(buflen == copy(newBuf, s.buf))
+		s.buf = newBuf
 	}
 
 	return offset - sz
 }
 
-//在arena里开辟一块空间，用以存放sl中的节点
-//返回值为在arena中的offset
+// 在arena里开辟一块空间，用以存放sl中的节点
+// 返回值为在arena中的offset
 func (s *Arena) putNode(height int) uint32 {
 	//implement me here！！！
 	// 这里的 node 要保存 value 、key 和 next 指针值
 	// 所以要计算清楚需要申请多大的内存空间
+	unusedSize := offsetSize * (defaultMaxLevel - height)
+	offset := MaxNodeSize - unusedSize
+	allocate := s.allocate(uint32(offset))
 
-	// levels 里面需要的大小
-	unusedsize := (defaultMaxLevel - height) * offsetSize
-
-	l := uint32(MaxNodeSize - unusedsize + nodeAlign)
-
-	n := s.allocate(uint32(l))
-	//内存对齐
-	m := (n + uint32(nodeAlign)) & ^uint32(nodeAlign)
-	return m
+	//TODO: 内存对齐
+	return allocate
 }
 
 func (s *Arena) putVal(v ValueStruct) uint32 {
 	//implement me here！！！
 	//将 Value 值存储到 arena 当中
 	// 并且将指针返回，返回的指针值应被存储在 Node 节点中
+	size := v.EncodedSize()
+	valueOffset := s.allocate(size)
+	v.EncodeValue(s.buf[valueOffset : valueOffset+size])
 
-	offset := s.allocate(v.EncodedSize())
-	v.EncodeValue(s.buf[offset:])
-
-	return offset
+	return valueOffset
 }
 
 func (s *Arena) putKey(key []byte) uint32 {
 	//implement me here！！！
 	//将  Key 值存储到 arena 当中
 	// 并且将指针返回，返回的指针值应被存储在 Node 节点中
+	len := len(key)
+	keyOffset := s.allocate(uint32(len))
+	buf := s.buf[keyOffset : keyOffset+uint32(len)]
+	copy(buf, key)
+	return keyOffset
 
-	l := len(key)
-	offset := s.allocate(uint32(l))
-
-	bufset := s.buf[offset : offset+uint32(l)]
-
-	AssertTrue(l == copy(bufset, key))
-	return offset
 }
 
 func (s *Arena) getElement(offset uint32) *Element {
 	if offset == 0 {
 		return nil
 	}
-
 	return (*Element)(unsafe.Pointer(&s.buf[offset]))
 }
 
@@ -105,20 +97,16 @@ func (s *Arena) getKey(offset uint32, size uint16) []byte {
 }
 
 func (s *Arena) getVal(offset uint32, size uint32) (v ValueStruct) {
-	v.DecodeValue(s.buf[offset : offset+size])
+	valueBuf := s.buf[offset : offset+size]
+	v.DecodeValue(valueBuf)
 	return
 }
 
-//用element在内存中的地址 - arena首字节的内存地址，得到在arena中的偏移量
+// 用element在内存中的地址 - arena首字节的内存地址，得到在arena中的偏移量
 func (s *Arena) getElementOffset(nd *Element) uint32 {
 	//implement me here！！！
-	//获取某个节点，在 arena 当中的偏移量
-	if nd == nil {
-		return 0
-	}
-
-	return uint32(uintptr(unsafe.Pointer(nd)) - uintptr(unsafe.Pointer(&s.buf[0])))
-
+	u := uintptr(unsafe.Pointer(nd)) - uintptr(unsafe.Pointer(&s.buf[0]))
+	return uint32(u)
 }
 
 func (e *Element) getNextOffset(h int) uint32 {
